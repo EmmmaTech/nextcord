@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
+import random
 import struct
 import sys
 import threading
 import time
-import traceback
 import zlib
-from collections import deque, namedtuple
+from collections import namedtuple
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Union
 
 import aiohttp
@@ -38,8 +37,6 @@ _log = logging.getLogger(__name__)
 
 __all__ = (
     "DiscordWebSocket",
-    "KeepAliveHandler",
-    "VoiceKeepAliveHandler",
     "DiscordVoiceWebSocket",
     "ReconnectWebSocket",
 )
@@ -105,108 +102,6 @@ class GatewayRatelimiter:
                     delta,
                 )
                 await asyncio.sleep(delta)
-
-
-class KeepAliveHandler(threading.Thread):
-    def __init__(self, *args, **kwargs) -> None:
-        ws: DiscordWebSocket = kwargs.pop("ws")  # will fail at `_main_thread_id` anyway
-        interval: Optional[float] = kwargs.pop("interval", None)
-        shard_id: Optional[int] = kwargs.pop("shard_id", None)
-        threading.Thread.__init__(self, *args, **kwargs)
-        self.ws = ws
-        self._main_thread_id = ws.thread_id
-        self.interval: Optional[float] = interval
-        self.daemon: bool = True
-        self.shard_id: Optional[int] = shard_id
-        self.msg: str = "Keeping shard ID %s websocket alive with sequence %s."
-        self.block_msg: str = "Shard ID %s heartbeat blocked for more than %s seconds."
-        self.behind_msg: str = "Can't keep up, shard ID %s websocket is %.1fs behind."
-        self._stop_ev: threading.Event = threading.Event()
-        self._last_ack: float = time.perf_counter()
-        self._last_send: float = time.perf_counter()
-        self._last_recv: float = time.perf_counter()
-        self.latency: float = float("inf")
-        self.heartbeat_timeout: float = ws._max_heartbeat_timeout
-
-    def run(self) -> None:
-        while not self._stop_ev.wait(self.interval):
-            if self._last_recv + self.heartbeat_timeout < time.perf_counter():
-                _log.warning(
-                    "Shard ID %s has stopped responding to the gateway. Closing and restarting.",
-                    self.shard_id,
-                )
-                coro = self.ws.close(4000)
-                f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
-
-                try:
-                    f.result()
-                except Exception:
-                    _log.exception("An error occurred while stopping the gateway. Ignoring.")
-                finally:
-                    self.stop()
-                    return  # noqa: B012  # ignoring is intentional
-
-            data = self.get_payload()
-            _log.debug(self.msg, self.shard_id, data["d"])
-            coro = self.ws.send_heartbeat(data)
-            f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
-            try:
-                # block until sending is complete
-                total = 0
-                while True:
-                    try:
-                        f.result(10)
-                        break
-                    except concurrent.futures.TimeoutError:
-                        total += 10
-                        try:
-                            frame = sys._current_frames()[self._main_thread_id]
-                        except KeyError:
-                            msg = self.block_msg
-                        else:
-                            stack = "".join(traceback.format_stack(frame))
-                            msg = f"{self.block_msg}\nLoop thread traceback (most recent call last):\n{stack}"
-                        _log.warning(msg, self.shard_id, total)
-
-            except Exception:
-                self.stop()
-            else:
-                self._last_send = time.perf_counter()
-
-    def get_payload(self) -> Dict[str, Any]:
-        return {"op": self.ws.HEARTBEAT, "d": self.ws.sequence}
-
-    def stop(self) -> None:
-        self._stop_ev.set()
-
-    def tick(self) -> None:
-        self._last_recv = time.perf_counter()
-
-    def ack(self) -> None:
-        ack_time = time.perf_counter()
-        self._last_ack = ack_time
-        self.latency = ack_time - self._last_send
-        if self.latency > 10:
-            _log.warning(self.behind_msg, self.shard_id, self.latency)
-
-
-class VoiceKeepAliveHandler(KeepAliveHandler):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.recent_ack_latencies = deque(maxlen=20)
-        self.msg = "Keeping shard ID %s voice websocket alive with timestamp %s."
-        self.block_msg = "Shard ID %s voice heartbeat blocked for more than %s seconds"
-        self.behind_msg = "High socket latency, shard ID %s heartbeat is %.1fs behind"
-
-    def get_payload(self) -> Dict[str, int]:
-        return {"op": self.ws.HEARTBEAT, "d": int(time.time() * 1000)}
-
-    def ack(self) -> None:
-        ack_time = time.perf_counter()
-        self._last_ack = ack_time
-        self._last_recv = ack_time
-        self.latency = ack_time - self._last_send
-        self.recent_ack_latencies.append(self.latency)
 
 
 class DiscordClientWebSocketResponse(aiohttp.ClientWebSocketResponse):
@@ -290,9 +185,13 @@ class DiscordWebSocket:
         self._dispatch: VariadicArgNone = lambda *_args: None
         # generic event listeners
         self._dispatch_listeners: List[EventListener] = []
-        # the keep alive
-        self._keep_alive: Optional[KeepAliveHandler] = None
-        self.thread_id: int = threading.get_ident()
+
+        # the heartbeat handler
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_ack_received: Optional[asyncio.Future[None]] = None
+        self.heartbeat_interval: float = 0.0
+        self._heartbeat_sent_time: float = 0.0
+        self.latency: float = 0.0
 
         # ws related stuff
         self.session_id: Optional[str] = None
@@ -401,6 +300,13 @@ class DiscordWebSocket:
         self._dispatch_listeners.append(entry)
         return future
 
+    async def heartbeat(self) -> None:
+        """Sends the HEARTBEAT packet."""
+        payload = {"op": self.HEARTBEAT, "d": self.sequence}
+        await self.send_heartbeat(payload)
+
+        self._heartbeat_sent_time = time.perf_counter()
+
     async def identify(self) -> None:
         """Sends the IDENTIFY packet."""
         state = self._connection
@@ -445,8 +351,20 @@ class DiscordWebSocket:
         await self.send_as_json(payload)
         _log.info("Shard ID %s has sent the RESUME payload.", self.shard_id)
 
+    async def _heartbeat_loop(self) -> None:
+        timeout = self.heartbeat_interval * random.random()
+        await asyncio.sleep(timeout)
+
+        while not self.socket.closed:
+            await self.heartbeat()
+
+            self._heartbeat_ack_received = self.loop.create_future()
+            await self._heartbeat_ack_received
+
+            await asyncio.sleep(self.heartbeat_interval)
+
     async def received_message(self, msg: Union[str, bytes], /) -> None:
-        if type(msg) is bytes:
+        if isinstance(msg, bytes):
             self._buffer.extend(msg)
 
             if len(msg) < 4 or msg[-4:] != b"\x00\x00\xff\xff":
@@ -469,9 +387,6 @@ class DiscordWebSocket:
         if seq is not None:
             self.sequence = seq
 
-        if self._keep_alive:
-            self._keep_alive.tick()
-
         if op != self.DISPATCH:
             if op == self.RECONNECT:
                 # "reconnect" can only be handled by the Client
@@ -481,25 +396,23 @@ class DiscordWebSocket:
                 await self.close()
                 raise ReconnectWebSocket(self.shard_id)
 
-            if op == self.HEARTBEAT_ACK:
-                if self._keep_alive:
-                    self._keep_alive.ack()
+            if op == self.HEARTBEAT_ACK and self._heartbeat_ack_received:
+                self._heartbeat_ack_received.set_result(None)
+                ack_time = time.perf_counter()
+                self.latency = ack_time - self._heartbeat_sent_time
                 return
 
             if op == self.HEARTBEAT:
-                if self._keep_alive:
-                    beat = self._keep_alive.get_payload()
-                    await self.send_as_json(beat)
+                await self.heartbeat()
                 return
 
             if op == self.HELLO:
-                interval = data["heartbeat_interval"] / 1000.0
-                self._keep_alive = KeepAliveHandler(
-                    ws=self, interval=interval, shard_id=self.shard_id
-                )
+                self.heartbeat_interval = data["heartbeat_interval"] / 1000.0
+
                 # send a heartbeat immediately
-                await self.send_as_json(self._keep_alive.get_payload())
-                self._keep_alive.start()
+                await self.heartbeat()
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
                 return
 
             if op == self.INVALIDATE_SESSION:
@@ -574,12 +487,6 @@ class DiscordWebSocket:
         for index in reversed(removed):
             del self._dispatch_listeners[index]
 
-    @property
-    def latency(self) -> float:
-        """:class:`float`: Measures latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds."""
-        heartbeat = self._keep_alive
-        return float("inf") if heartbeat is None else heartbeat.latency
-
     def _can_handle_close(self) -> bool:
         code = self._close_code or self.socket.close_code
         return code not in (1000, 4004, 4010, 4011, 4012, 4013, 4014)
@@ -607,10 +514,10 @@ class DiscordWebSocket:
                 _log.debug("Received %s", msg)
                 raise WebSocketClosure
         except (asyncio.TimeoutError, WebSocketClosure) as e:
-            # Ensure the keep alive handler is closed
-            if self._keep_alive:
-                self._keep_alive.stop()
-                self._keep_alive = None
+            # Ensure the heartbeat handler is closed
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
 
             if isinstance(e, asyncio.TimeoutError):
                 _log.info("Timed out receiving packet. Attempting a reconnect.")
@@ -721,9 +628,9 @@ class DiscordWebSocket:
         await self.send_as_json(payload)
 
     async def close(self, code: int = 4000) -> None:
-        if self._keep_alive:
-            self._keep_alive.stop()
-            self._keep_alive = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
         self._close_code = code
         await self.socket.close(code=code)
@@ -788,7 +695,14 @@ class DiscordVoiceWebSocket:
     ) -> None:
         self.ws: DiscordClientWebSocketResponse = socket
         self.loop: asyncio.AbstractEventLoop = loop
-        self._keep_alive: Optional[VoiceKeepAliveHandler] = None
+
+        # the heartbeat handler
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_ack_received: Optional[asyncio.Future[None]] = None
+        self.heartbeat_interval: float = 0.0
+        self._heartbeat_sent_time: float = 0.0
+        self._latencies: List[float] = []
+
         self._close_code: Optional[int] = None
         self.secret_key: Optional[List[int]] = None
         self._hook: Optional[Callable[..., Awaitable[None]]] = (
@@ -803,6 +717,12 @@ class DiscordVoiceWebSocket:
         await self.ws.send_str(utils.to_json(data))
 
     send_heartbeat = send_as_json
+
+    async def heartbeat(self) -> None:
+        payload = {"op": self.HEARTBEAT, "d": int(time.time() * 1000)}
+        await self.send_as_json(payload)
+
+        self._heartbeat_sent_time = time.perf_counter()
 
     async def resume(self) -> None:
         state = self._connection
@@ -879,6 +799,18 @@ class DiscordVoiceWebSocket:
 
         await self.send_as_json(payload)
 
+    async def _heartbeat_loop(self) -> None:
+        timeout = self.heartbeat_interval * random.random()
+        await asyncio.sleep(timeout)
+
+        while not self.ws.closed:
+            await self.heartbeat()
+
+            self._heartbeat_ack_received = self.loop.create_future()
+            await self._heartbeat_ack_received
+
+            await asyncio.sleep(self.heartbeat_interval)
+
     async def received_message(self, msg: Dict[str, Any]) -> None:
         _log.debug("Voice websocket frame received: %s", msg)
         op: int = msg["op"]
@@ -886,18 +818,26 @@ class DiscordVoiceWebSocket:
 
         if op == self.READY:
             await self.initial_connection(data)
-        elif op == self.HEARTBEAT_ACK:
-            if self._keep_alive is not None:
-                self._keep_alive.ack()
+
+        elif op == self.HEARTBEAT_ACK and self._heartbeat_ack_received:
+            self._heartbeat_ack_received.set_result(None)
+            ack_time = time.perf_counter()
+
+            if len(self._latencies) > 20:
+                self._latencies.clear()
+
+            self._latencies.append(ack_time - self._heartbeat_sent_time)
+
         elif op == self.RESUMED:
             _log.info("Voice RESUME succeeded.")
+
         elif op == self.SESSION_DESCRIPTION:
             self._connection.mode = data["mode"]
             await self.load_secret_key(data)
+
         elif op == self.HELLO:
-            interval = data["heartbeat_interval"] / 1000.0
-            self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
-            self._keep_alive.start()
+            self.heartbeat_interval = data["heartbeat_interval"] / 1000.0
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         if self._hook is not None:
             await self._hook(self, msg)
@@ -939,17 +879,15 @@ class DiscordVoiceWebSocket:
     @property
     def latency(self) -> float:
         """:class:`float`: Latency between a HEARTBEAT and its HEARTBEAT_ACK in seconds."""
-        heartbeat = self._keep_alive
-        return float("inf") if heartbeat is None else heartbeat.latency
+        return self._latencies[-1] if self._latencies else float("inf")
 
     @property
     def average_latency(self) -> float:
         """:class:`list`: Average of last 20 HEARTBEAT latencies."""
-        heartbeat = self._keep_alive
-        if heartbeat is None or not heartbeat.recent_ack_latencies:
+        if not self._latencies:
             return float("inf")
 
-        return sum(heartbeat.recent_ack_latencies) / len(heartbeat.recent_ack_latencies)
+        return sum(self._latencies) / len(self._latencies)
 
     async def load_secret_key(self, data: Dict[str, Any]) -> None:
         _log.info("received secret key for voice connection")
@@ -977,8 +915,9 @@ class DiscordVoiceWebSocket:
             raise ConnectionClosed(self.ws, shard_id=None, code=self._close_code)
 
     async def close(self, code: int = 1000) -> None:
-        if self._keep_alive is not None:
-            self._keep_alive.stop()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
         self._close_code = code
         await self.ws.close(code=code)
