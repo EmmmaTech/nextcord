@@ -49,6 +49,8 @@ __all__ = (
     "SortOrderType",
     "RoleConnectionMetadataType",
     "ForumLayoutType",
+    "GatewayOpcode",
+    "VoiceGatewayOpcode",
 )
 
 
@@ -2036,6 +2038,41 @@ class ForumLayoutType(IntEnum):
     gallery = 2
     """Display posts as a collection of posts with images, this is more image focused."""
 
+
+class GatewayOpcode(IntEnum):
+    """Opcodes for Discord gateway events.
+
+    .. versionadded:: 3.0
+    """
+
+    dispatch = 0
+    """Receive only. Denotes an event sent by Discord, such as READY."""
+    heartbeat = 1
+    """Keeps the connection alive between the server and client."""
+    identify = 2
+    """Send only. Starts a new session."""
+    presence = 3
+    """Send only. Updates your presence."""
+    voice_state = 4
+    """Send only. Starts a new connection to a voice guild."""
+    resume = 6
+    """Send only. Resumes an existing connection."""
+    reconnect = 7
+    """Receive only. Tells the client to reconnect to the gateway."""
+    request_members = 8
+    """Send only. Asks for the full member list of a guild."""
+    invalid_session = 9
+    """Receive only. Tells the client that the session has been invalidated
+    and to IDENTIFY again.
+    """
+    hello = 10
+    """Receive only. Tells the client the heartbeat interval."""
+    heartbeat_ack = 11
+    """Receive only. Confirms receiving of a heartbeat. Not having it implies
+    a connection issue.
+    """
+
+# TODO: VoiceGatewayOpcode
 
 T = TypeVar("T")
 

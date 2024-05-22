@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Protocol, TypeVar, Union
 
 if TYPE_CHECKING:
     from nextcord.application_command import ClientCog
@@ -23,3 +23,7 @@ if TYPE_CHECKING:
         Callable[[ClientCog, Interaction, Exception], Coro[Any]],
         Callable[[Interaction, Exception], Coro[Any]],
     ]
+
+    class DispatchProtocol(Protocol):
+        def __call__(self, event: str, *args: Any) -> None:
+            ...

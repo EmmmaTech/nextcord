@@ -11,21 +11,23 @@ import threading
 import time
 import zlib
 from collections import namedtuple
-from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Union, cast
 
 import aiohttp
 
 from . import utils
 from .activity import BaseActivity
-from .enums import SpeakingState
+from .enums import GatewayOpcode, SpeakingState, UnknownEnumValue, try_enum
 from .errors import ConnectionClosed, InvalidArgument
 
 if TYPE_CHECKING:
     from typing import Any, Protocol
 
     from .client import Client
+    from .http import HTTPClient
     from .state import ConnectionState
     from .types.activity import Activity
+    from .types.checks import DispatchProtocol
     from .voice_client import VoiceClient
 
     class VariadicArgNone(Protocol):
@@ -108,6 +110,337 @@ class DiscordClientWebSocketResponse(aiohttp.ClientWebSocketResponse):
     async def close(self, *, code: int = 4000, message: bytes = b"") -> bool:
         return await super().close(code=code, message=message)
 
+
+class Shard:
+    """Implements a sharded connection to Discord's gateway.
+
+    A shard may work independently, similarly to the old ``DiscordWebSocket`` class,
+    or can work in a cluster together.
+
+    Attributes
+    ----------
+    """
+
+    __slots__ = (
+        "_socket",
+        "_http",
+        "_token",
+        "_dispatch",
+        "_dispatch_listeners",
+        "_discord_parsers",
+
+        "_connection_task",
+        "_heartbeat_task",
+        "_heartbeat_ack_received",
+        "heartbeat_interval",
+        "_heartbeat_sent_time",
+        "latency",
+        "intents",
+        "session_id",
+        "resume_url",
+        "sequence",
+        "shard_id",
+        "shard_count",
+        "debug",
+
+        "_zlib",
+        "_buffer",
+        "_rate_limiter",
+    )
+
+    def __init__(
+        self, 
+        http: HTTPClient,
+        token: str,
+        dispatch: DispatchProtocol,
+        *,
+        intents: int,
+        shard_id: int = 0,
+        shard_count: int = 1,
+        debug: bool = False,
+    ):
+        self._socket: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._http: HTTPClient = http
+        self._token: str = token
+        self._dispatch: DispatchProtocol = dispatch
+        self._dispatch_listeners: List[EventListener] = []
+        self._discord_parsers: Dict[str, Any] = {}
+
+        self._connection_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+
+        self._heartbeat_ack_received: Optional[asyncio.Future[None]] = None
+        self.heartbeat_interval: float = 0.0
+        self._heartbeat_sent_time: float = 0.0
+        self.latency: float = 0.0
+
+        self.intents: int = intents
+        self.session_id: Optional[str] = None
+        self.resume_url: Optional[str] = None
+        self.sequence: Optional[int] = None
+        self.shard_id: int = shard_id
+        self.shard_count: int = shard_count
+        self.debug: bool = debug
+
+        self._zlib = zlib.decompressobj()
+        self._buffer: bytearray = bytearray()
+        self._rate_limiter: GatewayRatelimiter = GatewayRatelimiter()
+
+    async def send(self, data: Any, /) -> None:
+        if self._socket is None:
+            raise AttributeError("WebSocket has not been opened.")
+
+        await self._rate_limiter.block()
+
+        if self.debug:
+            self._dispatch("socket_raw_send", data)
+
+        await self._socket.send_str(data)
+
+    def _process_raw_data(self, msg: aiohttp.WSMessage) -> str:
+        data = msg.data
+
+        if msg.type is aiohttp.WSMsgType.BINARY:
+            data = cast(bytes, data)
+            self._buffer.extend(data)
+
+            if len(data) < 4 or data[-4:] != b"\x00\x00\xff\xff":
+                # TODO: add more specifics to this error message? maybe the data that was received?
+                raise ValueError("Invalid zlib encoded message received from the Gateway!")
+
+            data = self._zlib.decompress(self._buffer).decode("utf-8")
+            self._buffer = bytearray()
+        else:
+            data = cast(str, data)
+
+        return data
+
+    async def connect(self):
+        if self.session_id is not None and self.resume_url is not None:
+            self._socket = await self._http.ws_connect(self.resume_url)
+        else:
+            url = await self._http.get_gateway()
+            self._socket = await self._http.ws_connect(url)
+
+        self._connection_task = asyncio.create_task(self._connection_loop())
+        _log.info("Shard ID %s has successfully established a connection to the gateway.", self.shard_id)
+
+    async def disconnect(self, *, keep_session: bool = False):
+        if self._socket is None:
+            return
+
+        if self._connection_task:
+            self._connection_task.cancel()
+            self._connection_task = None
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+        if self._heartbeat_ack_received:
+            self._heartbeat_ack_received.cancel()
+            self._heartbeat_ack_received = None
+
+        if keep_session:
+            await self._socket.close(code=999)
+        else:
+            await self._socket.close()
+
+            self.resume_url = None
+            self.session_id = None
+            self.sequence = None
+
+        self._socket = None
+
+    async def _connection_loop(self) -> None:
+        if self._socket is None:
+            raise AttributeError("WebSocket has not been opened.")
+
+        async for msg in self._socket:
+            if msg.type is aiohttp.WSMsgType.TEXT or msg.type is aiohttp.WSMsgType.BINARY:
+                data = self._process_raw_data(msg)
+                payload = utils.from_json(data)
+                await self._process_payload(payload)
+            elif msg.type is aiohttp.WSMsgType.ERROR:
+                _log.debug("Received error %s", msg)
+                await self.disconnect(keep_session=False)
+                # TODO: raise exception?
+            elif msg.type in (
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.CLOSE,
+            ):
+                _log.debug("Received close %s", msg)
+                await self.disconnect(keep_session=False)
+                # TODO: raise exception?
+
+    async def _process_payload(self, payload: Dict[str, Any]) -> None:
+        op: GatewayOpcode = try_enum(GatewayOpcode, payload["op"])
+        data: Any = payload["d"]
+        seq: Optional[int] = payload["s"]
+
+        if isinstance(op, UnknownEnumValue):
+            _log.warning("Unknown OP code %s.", op)
+            return
+
+        if seq is not None:
+            self.sequence = seq
+
+        if op is not GatewayOpcode.dispatch:
+            if op is GatewayOpcode.reconnect:
+                _log.debug("Shard ID %s received RECONNECT opcode.", self.shard_id)
+                await self.disconnect()
+
+            if op is GatewayOpcode.heartbeat_ack and self._heartbeat_ack_received:
+                self._heartbeat_ack_received.set_result(None)
+                ack_time = time.perf_counter()
+                self.latency = ack_time - self._heartbeat_sent_time
+
+            if op is GatewayOpcode.heartbeat:
+                await self.heartbeat()
+
+            if op is GatewayOpcode.hello:
+                self.heartbeat_interval = float(data["heartbeat_interval"]) / 1000
+
+                await self.heartbeat()
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+                if self.session_id is not None:
+                    await self.resume()
+                else:
+                    await self.identify()
+
+            if op is GatewayOpcode.invalid_session:
+                await self.disconnect(keep_session=bool(data))
+
+        event: str = payload["t"]
+        await self.dispatch_events(data, event)
+
+    async def dispatch_events(self, data: Any, event: str) -> None:
+        if event == "READY":
+            self.session_id = data["session_id"]
+            self.resume_url = data["resume_gateway_url"]
+            # pass back shard ID to ready handler
+            data["__shard_id__"] = self.shard_id
+            _log.info(
+                "Shard ID %s has connected to Gateway: (Session ID: %s). Resume URL specified as %s",
+                self.shard_id,
+                self.session_id,
+                self.resume_url,
+            )
+
+        elif event == "RESUMED":
+            # pass back the shard ID to the resumed handler
+            data["__shard_id__"] = self.shard_id
+            _log.info(
+                "Shard ID %s has successfully RESUMED session %s.",
+                self.shard_id,
+                self.session_id,
+            )
+
+        # TODO: to prevent the weird hack to incorporate the shard id into the data,
+        # I think we should add a new parameter for discord parsers that is the shard that
+        # received the request.
+
+        try:
+            func = self._discord_parsers[event]
+        except KeyError:
+            _log.debug("Unknown event %s.", event)
+        else:
+            await utils.maybe_coroutine(func, data)
+
+        # remove the dispatched listeners
+        removed = []
+        for index, entry in enumerate(self._dispatch_listeners):
+            if entry.event != event:
+                continue
+
+            future = entry.future
+            if future.cancelled():
+                removed.append(index)
+                continue
+
+            try:
+                valid = entry.predicate(data)
+            except Exception as exc:
+                future.set_exception(exc)
+                removed.append(index)
+            else:
+                if valid:
+                    ret = data if entry.result is None else entry.result(data)
+                    future.set_result(ret)
+                    removed.append(index)
+
+        for index in reversed(removed):
+            del self._dispatch_listeners[index]
+
+    async def _heartbeat_loop(self) -> None:
+        if self._socket is None:
+            raise AttributeError("WebSocket has not been opened.")
+
+        loop = asyncio.get_running_loop()
+        timeout = self.heartbeat_interval * random.random()
+        await asyncio.sleep(timeout)
+
+        while not self._socket.closed:
+            await self.heartbeat()
+
+            self._heartbeat_ack_received = loop.create_future()
+            await self._heartbeat_ack_received
+
+            await asyncio.sleep(self.heartbeat_interval)
+
+    async def heartbeat(self):
+        """Sends the HEARTBEAT packet."""
+        payload = {"op": 1, "d": self.sequence}
+        await self.send(utils.to_json(payload))
+
+        self._heartbeat_sent_time = time.perf_counter()
+
+    async def identify(self) -> None:
+        """Sends the IDENTIFY packet."""
+        payload = {
+            "op": 2,
+            "d": {
+                "token": self._token,
+                "properties": {
+                    "os": sys.platform,
+                    "browser": "nextcord",
+                    "device": "nextcord",
+                },
+                "compress": True,
+                "large_threshold": 250,
+                "intents": self.intents,
+                "shard": [self.shard_id, self.shard_count],
+            },
+        }
+
+        # TODO: reintegrate activity and status
+        #if state._activity is not None or state._status is not None:
+        #    payload["d"]["presence"] = {
+        #        "status": state._status,
+        #        "game": state._activity,
+        #        "since": 0,
+        #        "afk": False,
+        #    }
+
+        #await self.call_hooks("before_identify", self.shard_id, initial=self._initial_identify)
+        await self.send(utils.to_json(payload))
+        _log.info("Shard ID %s has sent the IDENTIFY payload.", self.shard_id)
+
+    async def resume(self) -> None:
+        """Sends the RESUME packet."""
+        payload = {
+            "op": 6,
+            "d": {
+                "seq": self.sequence,
+                "session_id": self.session_id,
+                "token": self._token,
+            },
+        }
+
+        await self.send(utils.to_json(payload))
+        _log.info("Shard ID %s has sent the RESUME payload.", self.shard_id)
 
 class DiscordWebSocket:
     """Implements a WebSocket for Discord's gateway.

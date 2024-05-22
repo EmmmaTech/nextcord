@@ -17,7 +17,6 @@ from typing import (
     List,
     Literal,
     Optional,
-    Protocol,
     Sequence,
     Tuple,
     Type,
@@ -73,13 +72,10 @@ if TYPE_CHECKING:
         webhook,
         widget,
     )
+    from .types.checks import DispatchProtocol
     from .types.snowflake import Snowflake, SnowflakeList
 
     T = TypeVar("T")
-
-    class DispatchProtocol(Protocol):
-        def __call__(self, event: str, *args: Any) -> None:
-            ...
 
     Response = Coroutine[Any, Any, T]
 
