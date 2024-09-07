@@ -17,7 +17,7 @@ import aiohttp
 
 from . import utils
 from .activity import BaseActivity
-from .enums import GatewayOpcode, SpeakingState, UnknownEnumValue, try_enum
+from .enums import SpeakingState
 from .errors import ConnectionClosed, InvalidArgument
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from .state import ConnectionState
     from .types.activity import Activity
     from .types.checks import DispatchProtocol
+    from .types.gateway import ReceivableGatewayEvent
     from .voice_client import VoiceClient
 
     class VariadicArgNone(Protocol):
@@ -36,6 +37,18 @@ if TYPE_CHECKING:
 
 
 _log = logging.getLogger(__name__)
+
+
+# TODO: where to put?
+DISPATCH = 0
+HEARTBEAT = 1
+PRESENCE = 2
+IDENTIFY = 2
+RECONNECT = 7
+REQUEST_MEMBERS = 8
+INVALID_SESSION = 9
+HELLO = 10
+HEARTBEAT_ACK = 11
 
 __all__ = (
     "DiscordWebSocket",
@@ -114,7 +127,7 @@ class DiscordClientWebSocketResponse(aiohttp.ClientWebSocketResponse):
 class Shard:
     """Implements a sharded connection to Discord's gateway.
 
-    A shard may work independently, similarly to the old ``DiscordWebSocket`` class,
+    A shard can work independently, similarly to the old ``DiscordWebSocket`` class,
     or can work in a cluster together.
 
     Attributes
@@ -126,8 +139,8 @@ class Shard:
         "_http",
         "_token",
         "_dispatch",
-        "_dispatch_listeners",
-        "_discord_parsers",
+        "dispatch_listeners",
+        "discord_parsers",
 
         "_connection_task",
         "_heartbeat_task",
@@ -142,6 +155,8 @@ class Shard:
         "shard_id",
         "shard_count",
         "debug",
+        "activity",
+        "status",
 
         "_zlib",
         "_buffer",
@@ -149,7 +164,7 @@ class Shard:
     )
 
     def __init__(
-        self, 
+        self,
         http: HTTPClient,
         token: str,
         dispatch: DispatchProtocol,
@@ -163,8 +178,8 @@ class Shard:
         self._http: HTTPClient = http
         self._token: str = token
         self._dispatch: DispatchProtocol = dispatch
-        self._dispatch_listeners: List[EventListener] = []
-        self._discord_parsers: Dict[str, Any] = {}
+        self.dispatch_listeners: List[EventListener] = []
+        self.discord_parsers: Dict[str, Any] = {}
 
         self._connection_task: Optional[asyncio.Task[None]] = None
         self._heartbeat_task: Optional[asyncio.Task[None]] = None
@@ -181,12 +196,14 @@ class Shard:
         self.shard_id: int = shard_id
         self.shard_count: int = shard_count
         self.debug: bool = debug
+        self.activity: Optional[Activity] = None
+        self.status: Optional[str] = None
 
         self._zlib = zlib.decompressobj()
         self._buffer: bytearray = bytearray()
         self._rate_limiter: GatewayRatelimiter = GatewayRatelimiter()
 
-    async def send(self, data: Any, /) -> None:
+    async def send(self, data: str, /) -> None:
         if self._socket is None:
             raise AttributeError("WebSocket has not been opened.")
 
@@ -274,47 +291,41 @@ class Shard:
                 await self.disconnect(keep_session=False)
                 # TODO: raise exception?
 
-    async def _process_payload(self, payload: Dict[str, Any]) -> None:
-        op: GatewayOpcode = try_enum(GatewayOpcode, payload["op"])
-        data: Any = payload["d"]
-        seq: Optional[int] = payload["s"]
-
-        if isinstance(op, UnknownEnumValue):
-            _log.warning("Unknown OP code %s.", op)
-            return
-
+    async def _process_payload(self, payload: ReceivableGatewayEvent) -> None:
+        seq = payload.get("s")
         if seq is not None:
             self.sequence = seq
 
-        if op is not GatewayOpcode.dispatch:
-            if op is GatewayOpcode.reconnect:
-                _log.debug("Shard ID %s received RECONNECT opcode.", self.shard_id)
-                await self.disconnect()
+        if payload["op"] is DISPATCH:
+            event: str = payload["t"]
+            data = payload["d"]
+            await self.dispatch_events(data, event)
 
-            if op is GatewayOpcode.heartbeat_ack and self._heartbeat_ack_received:
-                self._heartbeat_ack_received.set_result(None)
-                ack_time = time.perf_counter()
-                self.latency = ack_time - self._heartbeat_sent_time
+        if payload["op"] is RECONNECT:
+            _log.debug("Shard ID %s received RECONNECT opcode.", self.shard_id)
+            await self.disconnect()
 
-            if op is GatewayOpcode.heartbeat:
-                await self.heartbeat()
+        if payload["op"] is HEARTBEAT_ACK and self._heartbeat_ack_received:
+            self._heartbeat_ack_received.set_result(None)
+            ack_time = time.perf_counter()
+            self.latency = ack_time - self._heartbeat_sent_time
 
-            if op is GatewayOpcode.hello:
-                self.heartbeat_interval = float(data["heartbeat_interval"]) / 1000
+        if payload["op"] is HEARTBEAT:
+            await self.heartbeat()
 
-                await self.heartbeat()
-                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if payload["op"] is HELLO:
+            self.heartbeat_interval = float(payload["d"]["heartbeat_interval"]) / 1000
 
-                if self.session_id is not None:
-                    await self.resume()
-                else:
-                    await self.identify()
+            await self.heartbeat()
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-            if op is GatewayOpcode.invalid_session:
-                await self.disconnect(keep_session=bool(data))
+            if self.session_id is not None:
+                await self.resume()
+            else:
+                await self.identify()
 
-        event: str = payload["t"]
-        await self.dispatch_events(data, event)
+        if payload["op"] is INVALID_SESSION:
+            await self.disconnect(keep_session=bool(payload["d"]))
 
     async def dispatch_events(self, data: Any, event: str) -> None:
         if event == "READY":
@@ -343,7 +354,7 @@ class Shard:
         # received the request.
 
         try:
-            func = self._discord_parsers[event]
+            func = self.discord_parsers[event]
         except KeyError:
             _log.debug("Unknown event %s.", event)
         else:
@@ -351,7 +362,7 @@ class Shard:
 
         # remove the dispatched listeners
         removed = []
-        for index, entry in enumerate(self._dispatch_listeners):
+        for index, entry in enumerate(self.dispatch_listeners):
             if entry.event != event:
                 continue
 
@@ -372,7 +383,7 @@ class Shard:
                     removed.append(index)
 
         for index in reversed(removed):
-            del self._dispatch_listeners[index]
+            del self.dispatch_listeners[index]
 
     async def _heartbeat_loop(self) -> None:
         if self._socket is None:
@@ -415,14 +426,13 @@ class Shard:
             },
         }
 
-        # TODO: reintegrate activity and status
-        #if state._activity is not None or state._status is not None:
-        #    payload["d"]["presence"] = {
-        #        "status": state._status,
-        #        "game": state._activity,
-        #        "since": 0,
-        #        "afk": False,
-        #    }
+        if self.activity is not None or self.status is not None:
+            payload["d"]["presence"] = {
+                "status": self.status,
+                "game": self.activity,
+                "since": 0,
+                "afk": False,
+            }
 
         #await self.call_hooks("before_identify", self.shard_id, initial=self._initial_identify)
         await self.send(utils.to_json(payload))
@@ -441,6 +451,56 @@ class Shard:
 
         await self.send(utils.to_json(payload))
         _log.info("Shard ID %s has sent the RESUME payload.", self.shard_id)
+
+    async def change_presence(
+        self,
+        *,
+        activity: Optional[BaseActivity] = None,
+        status: Optional[str] = None,
+        since: float = 0.0,
+    ) -> None:
+        if activity is not None:
+            activities: List[Activity] = [activity.to_dict()]
+        else:
+            activities: List[Activity] = []
+
+        if status == "idle":
+            since = int(time.time() * 1000)
+
+        payload = {
+            "op": PRESENCE,
+            "d": {"activities": activities, "afk": False, "since": since, "status": status},
+        }
+
+        sent = utils.to_json(payload)
+        await self.send(sent)
+        _log.debug("Shard ID %s has sent %s to change status.", self.shard_id, sent)
+
+    async def request_chunks(
+        self,
+        guild_id: int,
+        query: Optional[str] = None,
+        *,
+        limit: int,
+        user_ids: Optional[List[int]] = None,
+        presences: bool = False,
+        nonce: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "op": REQUEST_MEMBERS,
+            "d": {"guild_id": guild_id, "presences": presences, "limit": limit},
+        }
+
+        if nonce:
+            payload["d"]["nonce"] = nonce
+
+        if user_ids:
+            payload["d"]["user_ids"] = user_ids
+
+        if query is not None:
+            payload["d"]["query"] = query
+
+        await self.send(utils.to_json(payload))
 
 class DiscordWebSocket:
     """Implements a WebSocket for Discord's gateway.
