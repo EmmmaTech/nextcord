@@ -68,6 +68,22 @@ AutoShardedClient
 Application Info
 ----------------
 
+InstallParams
+~~~~~~~~~~~~~
+
+.. attributetable:: InstallParams
+
+.. autoclass:: InstallParams()
+    :members:
+
+ApplicationIntegrationTypeConfig
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: ApplicationIntegrationTypeConfig
+
+.. autoclass:: ApplicationIntegrationTypeConfig()
+    :members:
+
 AppInfo
 ~~~~~~~
 
@@ -1418,6 +1434,15 @@ of :class:`enum.Enum`.
 .. autoclass:: AuditLogAction
     :members:
 
+.. autoclass:: InviteType
+    :members:
+
+.. autoclass:: IntegrationType
+    :members:
+
+.. autoclass:: InteractionContextType
+    :members:
+
 Async Iterator
 --------------
 
@@ -2413,6 +2438,14 @@ MessageInteraction
 .. attributetable:: MessageInteraction
 
 .. autoclass:: MessageInteraction()
+    :members:
+
+MessageInteractionMetadata
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: MessageInteractionMetadata
+
+.. autoclass:: MessageInteractionMetadata()
     :members:
 
 Member
@@ -3436,6 +3469,10 @@ The following exceptions are thrown by the library.
 
 .. autoexception:: nextcord.opus.OpusNotLoaded
 
+.. autoexception:: HTTPInternalCancelled
+
+.. autoexception:: HTTPInternalRatelimitLocked
+
 .. autoexception:: ApplicationError
 
 .. autoexception:: ApplicationInvokeError
@@ -3462,9 +3499,12 @@ Exception Hierarchy
             - :exc:`NoMoreItems`
             - :exc:`GatewayNotFound`
             - :exc:`HTTPException`
+                - :exc:`Unauthorized`
                 - :exc:`Forbidden`
                 - :exc:`NotFound`
                 - :exc:`DiscordServerError`
+            - :exc:`HTTPInternalCancelled`
+                - :exc:`HTTPInternalRatelimitLocked`
         - :exc:`ApplicationError`
             - :exc:`ApplicationInvokeError`
             - :exc:`ApplicationCheckFailure`
