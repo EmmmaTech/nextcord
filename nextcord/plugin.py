@@ -22,7 +22,7 @@ from .application_command import (
     slash_command,
     user_command,
 )
-from .enums import Locale
+from .enums import IntegrationType, InteractionContextType, Locale
 from .permissions import Permissions
 from .utils import MISSING
 
@@ -71,6 +71,7 @@ class Plugin(Generic[ClientT]):
     __slots__ = (
         "_app_commands",
         "_app_command_checks",
+        "_listeners",
         "_bot",
         "_load_hooks",
         "_unload_hooks",
@@ -93,6 +94,7 @@ class Plugin(Generic[ClientT]):
         self._bot: Optional[ClientT] = None
         self._app_commands: List[BaseApplicationCommand] = []
         self._app_command_checks: List[ApplicationCheck] = []
+        self._listeners: Dict[str, List[CoroFunc]] = {}
         self._load_hooks: List[Callable[[], Coro[Any]]] = []
         self._unload_hooks: List[Callable[[], Coro[Any]]] = []
 
@@ -108,6 +110,11 @@ class Plugin(Generic[ClientT]):
         """List[:class:`BaseApplicationCommand`] Returns the list of all application commands registered to this plugin."""
         return self._app_commands
 
+    @property
+    def listeners(self) -> Dict[str, List[CoroFunc]]:
+        """Dict[:class:`str`, List[Callable[..., Any]]] Returns a dictionary of events mapped to their respective listeners."""
+        return self._listeners
+
     def slash_command(
         self,
         name: Optional[str] = None,
@@ -116,9 +123,10 @@ class Plugin(Generic[ClientT]):
         name_localizations: Optional[Dict[Union[Locale, str], str]] = None,
         description_localizations: Optional[Dict[Union[Locale, str], str]] = None,
         guild_ids: Optional[Iterable[int]] = MISSING,
-        dm_permission: Optional[bool] = None,
-        nsfw: bool = False,
         default_member_permissions: Optional[Union[Permissions, int]] = None,
+        nsfw: bool = False,
+        integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
+        contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
         force_global: bool = False,
     ):
         """Creates a Slash application command from the decorated function. Equivalent to :func:`.slash_command`."""
@@ -130,9 +138,10 @@ class Plugin(Generic[ClientT]):
                 description=description,
                 description_localizations=description_localizations,
                 guild_ids=guild_ids,
-                dm_permission=dm_permission,
                 default_member_permissions=default_member_permissions,
                 nsfw=nsfw,
+                integration_types=integration_types,
+                contexts=contexts,
                 force_global=force_global,
             )(func)
             self._app_commands.append(result)
@@ -146,9 +155,10 @@ class Plugin(Generic[ClientT]):
         *,
         name_localizations: Optional[Dict[Union[Locale, str], str]] = None,
         guild_ids: Optional[Iterable[int]] = MISSING,
-        dm_permission: Optional[bool] = None,
         default_member_permissions: Optional[Union[Permissions, int]] = None,
         nsfw: bool = False,
+        integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
+        contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
         force_global: bool = False,
     ):
         """Creates a User context command from the decorated function. Equivalent to :func:`.user_command`."""
@@ -158,9 +168,10 @@ class Plugin(Generic[ClientT]):
                 name=name,
                 name_localizations=name_localizations,
                 guild_ids=guild_ids,
-                dm_permission=dm_permission,
                 default_member_permissions=default_member_permissions,
                 nsfw=nsfw,
+                integration_types=integration_types,
+                contexts=contexts,
                 force_global=force_global,
             )(func)
             self._app_commands.append(result)
@@ -174,9 +185,10 @@ class Plugin(Generic[ClientT]):
         *,
         name_localizations: Optional[Dict[Union[Locale, str], str]] = None,
         guild_ids: Optional[Iterable[int]] = MISSING,
-        dm_permission: Optional[bool] = None,
         default_member_permissions: Optional[Union[Permissions, int]] = None,
         nsfw: bool = False,
+        integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
+        contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
         force_global: bool = False,
     ):
         """Creates a Message context command from the decorated function. Equivalent to :func:`.message_command`."""
@@ -186,9 +198,10 @@ class Plugin(Generic[ClientT]):
                 name=name,
                 name_localizations=name_localizations,
                 guild_ids=guild_ids,
-                dm_permission=dm_permission,
                 default_member_permissions=default_member_permissions,
                 nsfw=nsfw,
+                integration_types=integration_types,
+                contexts=contexts,
                 force_global=force_global,
             )(func)
             self._app_commands.append(result)
@@ -215,6 +228,37 @@ class Plugin(Generic[ClientT]):
         self._app_command_checks.append(func)
         return func
 
+    def listener(self, name: str = MISSING) -> Callable[[CoroFunc], CoroFunc]:
+        """A decorator that marks a function as a listener.
+
+        Equivalent to :meth:`Client.listen`.
+
+        Parameters
+        ----------
+        name: :class:`str`
+            The name of the event being listened to. If not provided, it
+            defaults to the function's name.
+
+        Raises
+        ------
+        TypeError
+            The function is not a coroutine function or a string was not passed as
+            the name.
+        """
+        def decorator(func: CoroFunc) -> CoroFunc:
+            if not asyncio.iscoroutinefunction(func):
+                raise TypeError("Listener function must be a coroutine function.")
+
+            to_assign = name or func.__name__
+            if to_assign in self._listeners:
+                self._listeners[to_assign].append(func)
+            else:
+                self._listeners[to_assign] = [func]
+
+            return func
+
+        return decorator
+
     def _run_hooks(self, hooks: List[Callable[[], Coro[Any]]]) -> None:
         for hook in hooks:
             # storing a reference to the created task wouldn't be helpful
@@ -233,6 +277,10 @@ class Plugin(Generic[ClientT]):
 
             bot.add_application_command(cmd)
 
+        for event, listeners in self._listeners.items():
+            for listener in listeners:
+                bot.add_listener(listener, event)
+
         self._run_hooks(self._load_hooks)
 
     async def unload(self):
@@ -247,6 +295,10 @@ class Plugin(Generic[ClientT]):
             # TODO: use remove_application_command from Client, when added
             self._bot._connection.remove_application_command(cmd)
 
+        for event, listeners in self._listeners.items():
+            for listener in listeners:
+                self._bot.remove_listener(listener, event)
+
         self._run_hooks(self._unload_hooks)
 
         self._bot = None
@@ -255,9 +307,9 @@ class Plugin(Generic[ClientT]):
         """Returns functions for this plugin that handle extension loading/unloading."""
 
         def setup(bot: ClientT):
-            _ = asyncio.create_task(self.load(bot))
+            asyncio.create_task(self.load(bot))  # noqa: RUF006
 
-        def teardown(bot: ClientT):
-            _ = asyncio.create_task(self.unload())
+        def teardown(_: ClientT):
+            asyncio.create_task(self.unload())  # noqa: RUF006
 
         return setup, teardown

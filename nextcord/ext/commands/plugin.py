@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, List, Optional, Type, TypeVar, Union
 
 import nextcord
 from nextcord.utils import MISSING
@@ -12,7 +12,7 @@ from .core import Command, Group, command, group
 if TYPE_CHECKING:
     from typing_extensions import Concatenate, ParamSpec
 
-    from ._types import Check, Coro, CoroFunc
+    from ._types import Check, Coro
     from .bot import AutoShardedBot, Bot
     from .context import Context
 
@@ -32,7 +32,6 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
     __slots__ = (
         "_commands",
         "_command_checks",
-        "_listeners",
     )
 
     _bot: Optional[BotT]
@@ -48,7 +47,6 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
 
         self._commands: List[Command] = []
         self._command_checks: List[Check] = []
-        self._listeners: Dict[str, List[CoroFunc]] = {}
 
     @property
     def bot(self) -> BotT:
@@ -59,11 +57,6 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
     def commands(self) -> List[Command]:
         """List[:class:`.Command`] Returns the list of all commands registered to this plugin."""
         return self._commands
-
-    @property
-    def listeners(self) -> Dict[str, List[CoroFunc]]:
-        """Dict[:class:`str`, List[Callable[..., Any]]] Returns a dictionary of events mapped to their respective listeners."""
-        return self._listeners
 
     def command(
         self,
@@ -114,37 +107,6 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
         self._command_checks.append(func)
         return func
 
-    def listener(self, name: str = MISSING) -> Callable[[CoroFunc], CoroFunc]:
-        """A decorator that marks a function as a listener.
-
-        Equivalent to :meth:`commands.Bot.listen`.
-
-        Parameters
-        ----------
-        name: :class:`str`
-            The name of the event being listened to. If not provided, it
-            defaults to the function's name.
-
-        Raises
-        ------
-        TypeError
-            The function is not a coroutine function or a string was not passed as
-            the name.
-        """
-        def decorator(func: CoroFunc) -> CoroFunc:
-            if not asyncio.iscoroutinefunction(func):
-                raise TypeError("Listener function must be a coroutine function.")
-
-            to_assign = name or func.__name__
-            if to_assign in self._listeners:
-                self._listeners[to_assign].append(func)
-            else:
-                self._listeners[to_assign] = [func]
-
-            return func
-
-        return decorator
-
     async def load(self, bot: BotT):
         await super().load(bot)
 
@@ -153,10 +115,6 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
                 cmd.add_check(check)
 
             bot.add_command(cmd)
-
-        for event, listeners in self._listeners.items():
-            for listener in listeners:
-                bot.add_listener(listener, event)
 
     async def unload(self):
         if self._bot is None:
@@ -172,7 +130,3 @@ class Plugin(nextcord.Plugin, Generic[BotT]):
                 cmd.remove_check(check)
 
             bot.remove_command(cmd.name)
-
-        for event, listeners in self._listeners.items():
-            for listener in listeners:
-                bot.remove_listener(listener, event)
