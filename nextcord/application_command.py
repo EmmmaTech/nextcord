@@ -52,7 +52,6 @@ from .enums import (
 from .errors import (
     ApplicationCheckFailure,
     ApplicationCommandOptionMissing,
-    ApplicationError,
     ApplicationInvokeError,
 )
 from .guild import Guild
@@ -93,7 +92,6 @@ __all__ = (
     "ApplicationCommandOption",
     "BaseCommandOption",
     "OptionConverter",
-    "ClientCog",
     "CallbackMixin",
     "SlashOption",
     "SlashCommandOption",
@@ -125,11 +123,6 @@ if TYPE_CHECKING:
     EllipsisType = ellipsis  # noqa: F821
 else:
     EllipsisType = type(Ellipsis)
-
-
-def _cog_special_method(func: FuncT) -> FuncT:
-    func.__cog_special_method__ = None
-    return func
 
 
 class CallbackWrapper:
@@ -408,22 +401,18 @@ class BaseCommandOption(ApplicationCommandOption):
         Function parameter to construct the command option with.
     command: Union[:class:`BaseApplicationCommand`, :class:`SlashApplicationSubcommand`]
         Application Command this option is for.
-    parent_cog: :class:`ClientCog`
-        Class that the function the option is for resides in.
     """
 
     def __init__(
         self,
         parameter: Parameter,
         command: Union[BaseApplicationCommand, SlashApplicationSubcommand],
-        parent_cog: Optional[ClientCog] = None,
     ) -> None:
         ApplicationCommandOption.__init__(self)
         self.parameter: Parameter = parameter
         self.command: Union[BaseApplicationCommand, SlashApplicationSubcommand] = command
         self.functional_name: str = parameter.name
         """Name of the kwarg in the function/method"""
-        self.parent_cog: Optional[ClientCog] = parent_cog
 
     @property
     def error_name(self) -> str:
@@ -488,124 +477,6 @@ class Mentionable(OptionConverter):
         return value
 
 
-class ClientCog:
-    # TODO: I get it's a terrible name, I just don't want it to duplicate current Cog right now.
-    __cog_application_commands__: List[BaseApplicationCommand]
-
-    def __new__(cls, *_args: Any, **_kwargs: Any):
-        new_cls = super(ClientCog, cls).__new__(cls)
-        new_cls._read_application_commands()
-        return new_cls
-
-    def _read_application_commands(self) -> None:
-        """Iterates through the application (sub)commands contained within the ClientCog, runs their from_callback
-        methods, then adds them to the internal list of application commands for this cog.
-        """
-        self.__cog_application_commands__ = []
-        for base in reversed(self.__class__.__mro__):
-            for value in base.__dict__.values():
-                is_static_method = isinstance(value, staticmethod)
-                if is_static_method:
-                    value = value.__func__
-
-                if isinstance(value, SlashApplicationCommand):
-                    value.parent_cog = self
-                    value.from_callback(value.callback, call_children=False)
-                    self.__cog_application_commands__.append(value)
-                elif isinstance(value, SlashApplicationSubcommand):
-                    # As subcommands are part of a parent command and
-                    #  not usable on their own, we don't add them to the command list, but do set the self_argument and
-                    #  run them from the callback.
-                    value.parent_cog = self
-                    value.from_callback(value.callback, call_children=False)
-                elif isinstance(value, BaseApplicationCommand):
-                    value.parent_cog = self
-                    value.from_callback(value.callback)
-                    self.__cog_application_commands__.append(value)
-
-    def has_application_command_error_handler(self) -> bool:
-        """:class:`bool`: Checks whether the cog has an error handler for application commands.
-
-        .. versionadded:: 3.0
-        """
-        return not hasattr(self.cog_application_command_error.__func__, "__cog_special_method__")
-
-    @property
-    def application_commands(self) -> List[BaseApplicationCommand]:
-        """Provides the list of application commands in this cog. Subcommands are not included."""
-        return self.__cog_application_commands__
-
-    def process_app_cmds(self) -> None:
-        """Formats all added application commands with their callback."""
-        # TODO: Find better name, check conflicts with actual cogs.
-        for app_cmd in self.application_commands:
-            app_cmd.from_callback(app_cmd.callback)
-
-    @classmethod
-    def _get_overridden_method(cls, method: FuncT) -> Optional[FuncT]:
-        """Return None if the method is not overridden. Otherwise returns the overridden method."""
-        return getattr(method.__func__, "__cog_special_method__", method)
-
-    @_cog_special_method
-    def cog_application_command_check(self, interaction: Interaction) -> bool:
-        """A special method that registers as a :func:`.ext.application_checks.check`
-        for every application command and subcommand in this cog.
-
-        This function **can** be a coroutine and must take a sole parameter,
-        ``interaction``, to represent the :class:`.Interaction`.
-        """
-        return True
-
-    @_cog_special_method
-    async def cog_application_command_error(
-        self, interaction: Interaction, error: ApplicationError
-    ) -> None:
-        """A special method that is called whenever an error is dispatched inside this cog.
-
-        This is similar to :func:`.on_application_command_error` except only applying
-        to the commands inside this cog.
-
-        This **must** be a coroutine.
-
-        .. versionadded:: 3.0
-
-        Parameters
-        ----------
-        interaction: :class:`.Interaction`
-            The Interaction where the error happened.
-        error: :class:`ApplicationError`
-            The error that happened.
-        """
-
-    @_cog_special_method
-    async def cog_application_command_before_invoke(self, interaction: Interaction) -> None:
-        """A special method that acts as a cog local pre-invoke hook.
-
-        This is similar to :meth:`.ApplicationCommand.before_invoke`.
-
-        This **must** be a coroutine.
-
-        Parameters
-        ----------
-        interaction: :class:`.Interaction`
-            The invocation interaction.
-        """
-
-    @_cog_special_method
-    async def cog_application_command_after_invoke(self, interaction: Interaction) -> None:
-        """A special method that acts as a cog local post-invoke hook.
-
-        This is similar to :meth:`.Command.after_invoke`.
-
-        This **must** be a coroutine.
-
-        Parameters
-        ----------
-        interaction: :class:`.Interaction`
-            The invocation interaction.
-        """
-
-
 class MissingApplicationCommandParametersWarning(UserWarning):
     """Warning category raised when creating a slash command from a callback when it appears
     the self and/or interaction parameter is missing based on the given type annotations.
@@ -626,7 +497,7 @@ class CallbackMixin:
     options: Dict[str, BaseCommandOption]
 
     def __init__(
-        self, callback: Optional[Callable] = None, parent_cog: Optional[ClientCog] = None
+        self, callback: Optional[Callable] = None
     ) -> None:
         """Contains code specific for adding callback support to a command class.
 
@@ -636,8 +507,6 @@ class CallbackMixin:
         ----------
         callback: Optional[:data:`~typing.Callable`]
             Callback to create options from and invoke. If provided, it must be a coroutine function.
-        parent_cog: Optional[:class:`ClientCog`]
-            Class that the callback resides on. Will be passed into the callback if provided.
         """
         self.callback: Optional[Callable] = callback
         self._callback_before_invoke: Optional[ApplicationHook] = None
@@ -650,22 +519,12 @@ class CallbackMixin:
             if not asyncio.iscoroutinefunction(self.callback):
                 raise TypeError(f"{self.error_name} Callback must be a coroutine")
 
-        self.parent_cog = parent_cog
-
-        if self.parent_cog:
-            self.error_callback: Optional[Callable] = self.parent_cog._get_overridden_method(
-                self.parent_cog.cog_application_command_error
-            )
-        else:
-            self.error_callback: Optional[Callable] = None
+        self.error_callback: Optional[Callable] = None
 
     def __call__(self, interaction: Interaction, *args, **kwargs):
         """Invokes the callback, injecting ``self`` if available."""
         if self.callback is None:
             raise ValueError("Cannot call callback when it is not set.")
-
-        if self.parent_cog:
-            return self.callback(self.parent_cog, interaction, *args, **kwargs)
 
         return self.callback(interaction, *args, **kwargs)
 
@@ -685,39 +544,6 @@ class CallbackMixin:
             String containing the class name, command name, and callback object.
         """
         return f"{self.__class__.__name__} {self.name} {self.callback}"
-
-    @property
-    def cog_before_invoke(self) -> Optional[ApplicationHook]:
-        """Returns the cog_application_command_before_invoke method for the cog that this command is in.
-        Returns ``None`` if not the method is not found.
-
-        Returns
-        -------
-        Optional[:class:`ApplicationHook`]
-            ``before_invoke`` method from the parent cog. ``None`` if not the method is not found.
-        """
-        if not self.parent_cog:
-            return None
-
-        return ClientCog._get_overridden_method(
-            self.parent_cog.cog_application_command_before_invoke
-        )
-
-    @property
-    def cog_after_invoke(self) -> Optional[ApplicationHook]:
-        """Returns the cog_application_command_after_invoke method for the cog that this command is in.
-
-        Returns
-        -------
-        Optional[:class:`ApplicationHook`]
-            ``after_invoke`` method from the parent cog. ``None`` if not the method is not found.
-        """
-        if not self.parent_cog:
-            return None
-
-        return ClientCog._get_overridden_method(
-            self.parent_cog.cog_application_command_after_invoke
-        )
 
     def has_error_handler(self) -> bool:
         """:class:`bool`: Checks whether the command has an error handler registered."""
@@ -781,11 +607,6 @@ class CallbackMixin:
         if self.name is None:
             self.name = self.callback.__name__
 
-        if self.error_callback is None and self.parent_cog:
-            self.error_callback = self.parent_cog._get_overridden_method(
-                self.parent_cog.cog_application_command_error
-            )
-
         try:
             if not asyncio.iscoroutinefunction(self.callback):
                 raise TypeError("Callback must be a coroutine")
@@ -794,12 +615,6 @@ class CallbackMixin:
             #  might be able to do something here.
             if option_class:
                 skip_counter = 1
-                # Getting the callback with `self_skip = inspect.ismethod(self.callback)` was problematic due to the
-                #  decorator going into effect before the class is instantiated, thus being a function at the time.
-                #  Try to look into fixing that in the future?
-                #  If self.parent_cog isn't reliable enough, we can possibly check if the first parameter name is `self`
-                if self.parent_cog:
-                    skip_counter += 1
 
                 # TODO: use typing.get_type_hints when 3.9 is standard
                 typehints = typing_extensions.get_type_hints(self.callback, include_extras=True)
@@ -812,34 +627,24 @@ class CallbackMixin:
                             annotation=typehints.get(name, param.empty)
                         )
 
+                origin = typing_extensions.get_origin(param.annotation)
+
                 non_option_params = sum(
-                    # could be a self or interaction parameter
-                    param.annotation is param.empty
-                    # will always be an interaction parameter
-                    or (
-                        isinstance(param.annotation, type)
-                        and issubclass(param.annotation, Interaction)
+                    (
+                        # should be an interaction parameter
+                        param.annotation is param.empty
+                        # will always be an interaction parameter
+                        or (
+                            isinstance(param.annotation, type)
+                            and issubclass(param.annotation, Interaction)
+                        )
+                        # will always be an interaction parameter (generic with the outermost type being Interaction)
+                        or (origin is not None and issubclass(origin, Interaction))
+                        for param in list(callback_params.values())[:skip_counter]
                     )
-                    # will always be an interaction parameter (generic with the outermost type being Interaction)
-                    or (
-                        (origin := typing_extensions.get_origin(param.annotation))
-                        and issubclass(origin, Interaction)
-                    )
-                    # will always be a self parameter
-                    # TODO: use typing.Self when 3.11 is standard
-                    or param.annotation is typing_extensions.Self
-                    # will always be a self parameter
-                    or isinstance(param.annotation, TypeVar)
-                    for param in list(callback_params.values())[:skip_counter]
                 )
 
-                if self.parent_cog is not None and non_option_params < 2:
-                    warnings.warn(
-                        f"Callback {self.error_name} is missing the self and/or interaction parameters. Please double check your function definition.",
-                        stacklevel=0,
-                        category=MissingApplicationCommandParametersWarning,
-                    )
-                elif non_option_params < 1:
+                if non_option_params < 1:
                     warnings.warn(
                         f"Callback {self.error_name} is missing the interaction parameter. Please double check your function definition.",
                         stacklevel=0,
@@ -850,7 +655,7 @@ class CallbackMixin:
                     if skip_counter:
                         skip_counter -= 1
                     else:
-                        arg = option_class(param, self, parent_cog=self.parent_cog)  # type: ignore
+                        arg = option_class(param, self)  # type: ignore
                         # this is a mixin, so `self` would be odd here
 
                         if not arg.name:
@@ -866,7 +671,7 @@ class CallbackMixin:
         """|coro|
 
         Checks if the command can be executed by checking all the predicates
-        inside the :attr:`~ApplicationCommand.checks` attribute, as well as all global and cog checks.
+        inside the :attr:`~ApplicationCommand.checks` attribute, as well as all global checks.
 
         Parameters
         ----------
@@ -898,20 +703,10 @@ class CallbackMixin:
                         f"The global check functions for application command {self.error_name} failed."
                     )
 
-        # Cog check
-        if self.parent_cog:
-            cog_check = ClientCog._get_overridden_method(
-                self.parent_cog.cog_application_command_check
-            )
-            if cog_check is not None and not await maybe_coroutine(cog_check, interaction):
-                raise ApplicationCheckFailure(
-                    f"The cog check functions for application command {self.error_name} failed."
-                )
-
         # Command checks
         for check in self.checks:
             try:
-                check_result = await maybe_coroutine(check, interaction)  # type: ignore
+                check_result = await maybe_coroutine(check, interaction)
             # To catch any subclasses of ApplicationCheckFailure.
             except ApplicationCheckFailure:
                 raise
@@ -950,10 +745,7 @@ class CallbackMixin:
 
         if can_run:
             if self._callback_before_invoke is not None:
-                await self._callback_before_invoke(interaction)  # type: ignore
-
-            if (before_invoke := self.cog_before_invoke) is not None:
-                await before_invoke(interaction)  # type: ignore
+                await self._callback_before_invoke(interaction)
 
             if (before_invoke := interaction.client._application_command_before_invoke) is not None:
                 await before_invoke(interaction)
@@ -971,10 +763,7 @@ class CallbackMixin:
                 state.dispatch("application_command_completion", interaction)
             finally:
                 if self._callback_after_invoke is not None:
-                    await self._callback_after_invoke(interaction)  # type: ignore
-
-                if (after_invoke := self.cog_after_invoke) is not None:
-                    await after_invoke(interaction)  # type: ignore
+                    await self._callback_after_invoke(interaction)
 
                 if (
                     after_invoke := interaction.client._application_command_after_invoke
@@ -1055,7 +844,6 @@ class AutocompleteOptionMixin:
     def __init__(
         self,
         autocomplete_callback: Optional[Callable] = None,
-        parent_cog: Optional[ClientCog] = None,
     ) -> None:
         """Contains code for providing autocomplete support, specifically for options.
 
@@ -1065,13 +853,10 @@ class AutocompleteOptionMixin:
         ----------
         autocomplete_callback: Optional[:data:`~typing.Callable`]
             Callback to create options from and invoke. If provided, it must be a coroutine function.
-        parent_cog: Optional[:class:`ClientCog`]
-            Class that the callback resides on. Will be passed into the callback if provided.
 
         """
         self.autocomplete_callback: Optional[Callable] = autocomplete_callback
         self.autocomplete_options: Set[str] = set()
-        self.parent_cog: Optional[ClientCog] = parent_cog
 
     def from_autocomplete_callback(self, callback: Callable) -> AutocompleteOptionMixin:
         """Parses a callback meant to be the autocomplete function."""
@@ -1081,9 +866,6 @@ class AutocompleteOptionMixin:
 
         skip_count = 2  # We skip the first and second args, they are always the Interaction and
         #  the primary autocomplete value.
-        if self.parent_cog:
-            # If there's a parent cog, there should be a self. Skip it too.
-            skip_count += 1
 
         for name in signature(self.autocomplete_callback).parameters:
             if skip_count:
@@ -1102,11 +884,6 @@ class AutocompleteOptionMixin:
         if self.autocomplete_callback is None:
             raise ValueError("Autocomplete hasn't been set for this function.")
 
-        if self.parent_cog:
-            return await self.autocomplete_callback(
-                self.parent_cog, interaction, option_value, **kwargs
-            )
-
         return await self.autocomplete_callback(interaction, option_value, **kwargs)
 
 
@@ -1115,17 +892,11 @@ class AutocompleteCommandMixin:
     children: Dict[str, SlashApplicationSubcommand]
     _state: ConnectionState
 
-    def __init__(self, parent_cog: Optional[ClientCog] = None) -> None:
+    def __init__(self) -> None:
         """Contains code for providing autocomplete support, specifically for application commands.
 
         If you are a normal user, you shouldn't be using this.
-
-        Parameters
-        ----------
-        parent_cog: Optional[:class:`ClientCog`]
-            Class that the callback resides on. Will be passed into the callback if provided.
         """
-        self.parent_cog = parent_cog
         # Why does this exist, and why is it "temp", you may ask? :class:`SlashCommandOption`'s are only available
         # after the callback is fully parsed when the :class:`Client` or :class:`ClientCog` runs the from_callback
         # method, thus we have to hold the decorated autocomplete callbacks temporarily until then.
@@ -1441,12 +1212,11 @@ class SlashCommandOption(BaseCommandOption, SlashOption, AutocompleteOptionMixin
         self,
         parameter: Parameter,
         command: Union[SlashApplicationCommand, SlashApplicationSubcommand],
-        parent_cog: Optional[ClientCog] = None,
     ) -> None:
-        BaseCommandOption.__init__(self, parameter, command, parent_cog)
+        BaseCommandOption.__init__(self, parameter, command)
         SlashOption.__init__(self)
         # We subclassed SlashOption because we must handle all attributes it has.
-        AutocompleteOptionMixin.__init__(self, parent_cog=parent_cog)
+        AutocompleteOptionMixin.__init__(self)
 
         if isinstance(parameter.default, SlashOption):
             # Remember: Values that the user provided in SlashOption should override any logic.
@@ -1804,8 +1574,8 @@ class SlashCommandMixin(CallbackMixin):
         _children: Dict[str, SlashApplicationSubcommand]
         _options: Dict[str, SlashCommandOption]
 
-    def __init__(self, callback: Optional[Callable], parent_cog: Optional[ClientCog]) -> None:
-        CallbackMixin.__init__(self, callback=callback, parent_cog=parent_cog)
+    def __init__(self, callback: Optional[Callable]) -> None:
+        CallbackMixin.__init__(self, callback=callback)
         self._options = {}
         self._parsed_docstring: Optional[Dict[str, Any]] = None
         self._children: Dict[str, SlashApplicationSubcommand] = {}
@@ -1975,7 +1745,6 @@ class BaseApplicationCommand(CallbackMixin, CallbackWrapperMixin):
         nsfw: bool = False,
         integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
         contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
-        parent_cog: Optional[ClientCog] = None,
         force_global: bool = False,
     ) -> None:
         """Base application command class that all specific application command classes should subclass. All common
@@ -2017,13 +1786,11 @@ class BaseApplicationCommand(CallbackMixin, CallbackWrapperMixin):
             Where the command can be used, only for globally-scoped commands. By default, all interaction context types are included for new commands.
 
             .. versionadded:: 3.0
-        parent_cog: Optional[:class:`ClientCog`]
-            ``ClientCog`` to forward to the callback as the ``self`` argument.
         force_global: :class:`bool`
             If this command should be registered as a global command, ALONG WITH all guild IDs set.
         """
         CallbackWrapperMixin.__init__(self, callback)
-        CallbackMixin.__init__(self, callback=callback, parent_cog=parent_cog)
+        CallbackMixin.__init__(self, callback=callback)
         self._state: Optional[ConnectionState] = None
         self.type = cmd_type or ApplicationCommandType(1)
         self.name: Optional[str] = name
@@ -2623,7 +2390,6 @@ class SlashApplicationSubcommand(SlashCommandMixin, AutocompleteCommandMixin, Ca
         description_localizations: Optional[Dict[Union[Locale, str], str]] = None,
         callback: Optional[Callable] = None,
         parent_cmd: Union[SlashApplicationCommand, SlashApplicationSubcommand, None] = None,
-        parent_cog: Optional[ClientCog] = None,
         inherit_hooks: bool = False,
     ) -> None:
         """Slash Application Subcommand, supporting additional subcommands and autocomplete.
@@ -2649,14 +2415,12 @@ class SlashApplicationSubcommand(SlashCommandMixin, AutocompleteCommandMixin, Ca
         cmd_type: :class:`ApplicationCommandOptionType`
             Should either be ``ApplicationCommandOptionType.sub_command`` or
             ``ApplicationCommandOptionType.sub_command_group``
-        parent_cog: Optional[:class:`ClientCog`]
-            Parent cog for the callback, if it exists. If provided, it will be given to the callback as ``self``.
         inherit_hooks: :class:`bool`
             If this subcommand should inherit the parent (sub)commands ``before_invoke`` and ``after_invoke`` callbacks.
             Defaults to ``False``..
         """
-        SlashCommandMixin.__init__(self, callback=callback, parent_cog=parent_cog)
-        AutocompleteCommandMixin.__init__(self, parent_cog)
+        SlashCommandMixin.__init__(self, callback=callback)
+        AutocompleteCommandMixin.__init__(self)
         CallbackWrapperMixin.__init__(self, callback)
 
         self.name: Optional[str] = name
@@ -2818,7 +2582,6 @@ class SlashApplicationSubcommand(SlashCommandMixin, AutocompleteCommandMixin, Ca
                 callback=func,
                 parent_cmd=self,
                 cmd_type=ApplicationCommandOptionType.sub_command,
-                parent_cog=self.parent_cog,
                 inherit_hooks=inherit_hooks,
             )
             self._children[
@@ -2863,7 +2626,6 @@ class SlashApplicationCommand(SlashCommandMixin, BaseApplicationCommand, Autocom
         nsfw: bool = False,
         integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
         contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
-        parent_cog: Optional[ClientCog] = None,
         force_global: bool = False,
     ) -> None:
         """Represents a Slash Application Command built from the given callback, able to be registered to multiple
@@ -2905,8 +2667,6 @@ class SlashApplicationCommand(SlashCommandMixin, BaseApplicationCommand, Autocom
             Where the command can be used, only for globally-scoped commands. By default, all interaction context types included for new commands.
 
             .. versionadded:: 3.0
-        parent_cog: Optional[:class:`ClientCog`]
-            ``ClientCog`` to forward to the callback as the ``self`` argument.
         force_global: :class:`bool`
             If this command should be registered as a global command, ALONG WITH all guild IDs set.
         """
@@ -2923,11 +2683,10 @@ class SlashApplicationCommand(SlashCommandMixin, BaseApplicationCommand, Autocom
             nsfw=nsfw,
             integration_types=integration_types,
             contexts=contexts,
-            parent_cog=parent_cog,
             force_global=force_global,
         )
-        AutocompleteCommandMixin.__init__(self, parent_cog=parent_cog)
-        SlashCommandMixin.__init__(self, callback=callback, parent_cog=parent_cog)
+        AutocompleteCommandMixin.__init__(self)
+        SlashCommandMixin.__init__(self, callback=callback)
 
     @property
     def description(self) -> str:
@@ -3018,7 +2777,6 @@ class SlashApplicationCommand(SlashCommandMixin, BaseApplicationCommand, Autocom
                 callback=func,
                 parent_cmd=self,
                 cmd_type=ApplicationCommandOptionType.sub_command,
-                parent_cog=self.parent_cog,
                 inherit_hooks=inherit_hooks,
             )
             self.children[
@@ -3044,7 +2802,6 @@ class UserApplicationCommand(BaseApplicationCommand):
         nsfw: bool = False,
         integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
         contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
-        parent_cog: Optional[ClientCog] = None,
         force_global: bool = False,
     ) -> None:
         """Represents a User Application Command that will give the user to the given callback, able to be registered to
@@ -3077,8 +2834,6 @@ class UserApplicationCommand(BaseApplicationCommand):
             Where the command can be used, only for globally-scoped commands. By default, all interaction context types included for new commands.
 
             .. versionadded:: 3.0
-        parent_cog: Optional[:class:`ClientCog`]
-            ``ClientCog`` to forward to the callback as the ``self`` argument.
         force_global: :class:`bool`
             If this command should be registered as a global command, ALONG WITH all guild IDs set.
         """
@@ -3093,7 +2848,6 @@ class UserApplicationCommand(BaseApplicationCommand):
             nsfw=nsfw,
             integration_types=integration_types,
             contexts=contexts,
-            parent_cog=parent_cog,
             force_global=force_global,
         )
 
@@ -3133,7 +2887,6 @@ class MessageApplicationCommand(BaseApplicationCommand):
         nsfw: bool = False,
         integration_types: Optional[Iterable[Union[IntegrationType, int]]] = None,
         contexts: Optional[Iterable[Union[InteractionContextType, int]]] = None,
-        parent_cog: Optional[ClientCog] = None,
         force_global: bool = False,
     ) -> None:
         """Represents a Message Application Command that will give the message to the given callback, able to be
@@ -3166,8 +2919,6 @@ class MessageApplicationCommand(BaseApplicationCommand):
             Where the command can be used, only for globally-scoped commands. By default, all interaction context types included for new commands.
 
             .. versionadded:: 3.0
-        parent_cog: Optional[:class:`ClientCog`]
-            ``ClientCog`` to forward to the callback as the ``self`` argument.
         force_global: :class:`bool`
             If this command should be registered as a global command, ALONG WITH all guild IDs set.
         """
@@ -3182,7 +2933,6 @@ class MessageApplicationCommand(BaseApplicationCommand):
             nsfw=nsfw,
             integration_types=integration_types,
             contexts=contexts,
-            parent_cog=parent_cog,
             force_global=force_global,
         )
 

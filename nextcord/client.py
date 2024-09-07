@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from nextcord.types.checks import ApplicationCheck, ApplicationHook
 
     from .abc import GuildChannel, PrivateChannel, Snowflake, SnowflakeTime
-    from .application_command import ClientCog, SlashApplicationSubcommand
+    from .application_command import SlashApplicationSubcommand
     from .asset import Asset
     from .channel import DMChannel
     from .enums import IntegrationType, InteractionContextType, Locale
@@ -349,7 +349,6 @@ class Client:
         self._token: Optional[str] = None
 
         self._lazy_load_commands: bool = lazy_load_commands
-        self._client_cogs: Set[ClientCog] = set()
         self._rollout_associate_known: bool = rollout_associate_known
         self._rollout_delete_unknown: bool = rollout_delete_unknown
         self._rollout_register_new: bool = rollout_register_new
@@ -608,10 +607,6 @@ class Client:
             return  # Not supposed to ever happen
 
         if interaction.application_command.has_error_handler():
-            return
-
-        cog = interaction.application_command.parent_cog
-        if cog and cog.has_application_command_error_handler():
             return
 
         print(  # noqa: T201
@@ -2629,7 +2624,6 @@ class Client:
             This replaces the now removed ``add_startup_application_commands`` method.
         """
         self._add_decorated_application_commands()
-        self.add_all_cog_commands()
 
     async def on_guild_available(self, guild: Guild) -> None:
         try:
@@ -2662,25 +2656,6 @@ class Client:
             command.from_callback(command.callback)
 
             self.add_application_command(command, use_rollout=True, pre_remove=False)
-
-    def add_all_cog_commands(self) -> None:
-        """Adds all :class:`ApplicationCommand` objects inside added cogs to the application command list."""
-        for cog in self._client_cogs:
-            if to_register := cog.application_commands:
-                for cmd in to_register:
-                    self.add_application_command(cmd, use_rollout=True, pre_remove=False)
-
-    def add_cog(self, cog: ClientCog) -> None:
-        for app_cmd in cog.application_commands:
-            self.add_application_command(app_cmd, use_rollout=True)
-
-        self._client_cogs.add(cog)
-
-    def remove_cog(self, cog: ClientCog) -> None:
-        for app_cmd in cog.application_commands:
-            self._connection.remove_application_command(app_cmd)
-
-        self._client_cogs.discard(cog)
 
     def user_command(
         self,
