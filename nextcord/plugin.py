@@ -29,12 +29,13 @@ from .utils import MISSING
 if TYPE_CHECKING:
     from .client import Client
     from .shard import AutoShardedClient
-    from .types.checks import ApplicationCheck, Coro, CoroFunc
+    from .types.checks import ApplicationCheck, ApplicationErrorCallback, Coro, CoroFunc
 
 __all__ = ("Plugin",)
 
 
 ClientT = TypeVar("ClientT", bound="Union[Client, AutoShardedClient]")
+HookFunc = Callable[[], Coro[Any]]
 
 
 # TODO: maybe just types.SimpleNamespace?
@@ -70,6 +71,7 @@ class Plugin(Generic[ClientT]):
 
     __slots__ = (
         "_app_commands",
+        "_app_command_error",
         "_app_command_checks",
         "_listeners",
         "_bot",
@@ -93,10 +95,11 @@ class Plugin(Generic[ClientT]):
 
         self._bot: Optional[ClientT] = None
         self._app_commands: List[BaseApplicationCommand] = []
+        self._app_command_error: Optional[ApplicationErrorCallback] = None
         self._app_command_checks: List[ApplicationCheck] = []
         self._listeners: Dict[str, List[CoroFunc]] = {}
-        self._load_hooks: List[Callable[[], Coro[Any]]] = []
-        self._unload_hooks: List[Callable[[], Coro[Any]]] = []
+        self._load_hooks: List[HookFunc] = []
+        self._unload_hooks: List[HookFunc] = []
 
     @property
     def client(self) -> ClientT:
@@ -209,6 +212,44 @@ class Plugin(Generic[ClientT]):
 
         return decorator
 
+    def load_hook(self, func: HookFunc) -> HookFunc:
+        """A decorator that marks a function as a load hook for this plugin.
+
+        Parameters
+        ----------
+        func: Callable[[], Any]
+            The function that will be used as a load hook.
+
+        Raises
+        ------
+        TypeError
+            The function is not a coroutine function.
+        """
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError("Load hook must be a coroutine function.")
+
+        self._load_hooks.append(func)
+        return func
+
+    def unload_hook(self, func: HookFunc) -> HookFunc:
+        """A decorator that marks a function as a unload hook for this plugin.
+
+        Parameters
+        ----------
+        func: Callable[[], Any]
+            The function that will be used as a unload hook.
+
+        Raises
+        ------
+        TypeError
+            The function is not a coroutine function.
+        """
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError("Unload hook must be a coroutine function.")
+
+        self._unload_hooks.append(func)
+        return func
+
     def application_command_check(self, func: ApplicationCheck) -> ApplicationCheck:
         """A decorator that marks a function as a check for every application command in this plugin.
 
@@ -226,6 +267,25 @@ class Plugin(Generic[ClientT]):
             raise TypeError("Check function must be a coroutine function.")
 
         self._app_command_checks.append(func)
+        return func
+
+    def on_application_command_error(self, func: ApplicationErrorCallback) -> ApplicationErrorCallback:
+        """A decorator that marks a function as a error handler for every application command in this plugin.
+
+        Parameters
+        ----------
+        func: :class:`ApplicationErrorCallback`
+            The function that will be used as the error handler.
+
+        Raises
+        ------
+        TypeError
+            The function is not a coroutine function.
+        """
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError("Error handler must be a coroutine function.")
+
+        self._app_command_error = func
         return func
 
     def listener(self, name: str = MISSING) -> Callable[[CoroFunc], CoroFunc]:
@@ -274,6 +334,9 @@ class Plugin(Generic[ClientT]):
         for cmd in self._app_commands:
             for check in self._app_command_checks:
                 cmd.add_check(check)
+
+            if cmd.error_callback is None:
+                cmd.error_callback = self._app_command_error
 
             bot.add_application_command(cmd)
 
