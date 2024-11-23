@@ -31,11 +31,12 @@ if TYPE_CHECKING:
     from .shard import AutoShardedClient
     from .types.checks import ApplicationCheck, ApplicationErrorCallback, Coro, CoroFunc
 
+    HookFunc = Callable[[], Coro[Any]]
+
 __all__ = ("Plugin",)
 
 
 ClientT = TypeVar("ClientT", bound="Union[Client, AutoShardedClient]")
-HookFunc = Callable[[], Coro[Any]]
 
 
 # TODO: maybe just types.SimpleNamespace?
